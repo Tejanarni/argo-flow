@@ -1,0 +1,189 @@
+ARGO RUNBOOKS - FRESH LAPTOP SETUP (Windows + Docker Desktop Kubernetes)
+=========================================================================
+
+What gets installed
+-------------------
+  Helm chart : bitnami/argo-workflows 13.0.6 (Argo Workflows v3.7.1) -> namespace "runbooks"
+  Manifests  : manifests/rbac       -> runner/human ServiceAccounts, Roles, Bindings
+                                       (also creates namespaces runbooks-l3, runbook-demo-dev)
+               manifests/demo-apps  -> demo-app Deployment + demo-stateful StatefulSet (runbook-demo-dev)
+               manifests/runbooks   -> L1/L2 WorkflowTemplates + CronWorkflows (runbooks)
+                                       L3 WorkflowTemplates (runbooks-l3)
+
+Install order matters: helm chart (CRDs + namespace "runbooks") -> rbac -> demo-apps -> runbooks.
+
+Auth / RBAC model (values.yaml)
+-------------------------------
+  argo-server runs with --auth-mode=sso AND --auth-mode=client:
+    sso    -> "Login" button, Azure Entra ID. The user's Entra security group is mapped to a
+              ServiceAccount via the workflows.argoproj.io/rbac-rule annotations in
+              manifests/rbac/humans.yaml, and Argo acts AS that SA (sso.rbac.enabled: true).
+    client -> paste a Kubernetes bearer token in the UI (handy for testing without Entra).
+  No login = 401. There is no anonymous access any more.
+
+    Entra group (Object ID)                  -> ServiceAccount   -> can do
+    d16dd38c-b215-4e9b-9a23-40a2046d9dc8 (L1) -> l1-user         -> submit + view, CANNOT resume/approve
+    5ebf475a-d7ea-477a-995b-f5bb3f8ade26 (L2) -> l2-approver     -> + resume (approve) / update workflows
+    3b90db67-7706-44b8-b13b-1215790f90dd (L3) -> l3-approver     -> + delete workflows
+  A user in none of these groups can sign in to Entra but gets no access in Argo.
+
+
+1. Prerequisites (one time)
+---------------------------
+  a) Install tools (PowerShell, as admin):
+       winget install -e --id Docker.DockerDesktop
+       winget install -e --id Git.Git
+       winget install -e --id Kubernetes.kubectl
+       winget install -e --id Helm.Helm
+     Argo CLI (optional, for submitting runbooks from the terminal):
+       download argo-windows-amd64.exe.gz from https://github.com/argoproj/argo-workflows/releases/tag/v3.7.1
+       unzip, rename to argo.exe, put it in a folder on PATH (e.g. C:\Users\<you>\bin)
+
+  b) Docker Desktop -> Settings -> Kubernetes -> "Enable Kubernetes" -> Apply & restart.
+     Give Docker at least 4 CPU / 8 GB RAM (Settings -> Resources).
+
+  c) Check the cluster:
+       kubectl config use-context docker-desktop
+       kubectl get nodes            # docker-desktop   Ready
+
+  d) Azure Entra app registration (only needed for SSO login; full walkthrough: docs/entra-setup.md).
+     Already done once for this tenant -- on a new laptop just confirm:
+       - Redirect URI (Web): http://localhost:2746/oauth2/callback
+       - Token configuration -> groups claim -> Security groups
+       - Your Entra user is a member of the L1 / L2 / L3 group you want to test
+       - Tenant ID in values.yaml (server.auth.sso.config.issuer) and the client id/secret in
+         values.yaml (extraDeploy -> argo-server-sso Secret) are current.
+         If the client secret was rotated, update it in values.yaml before step 3.
+
+
+2. Get the code
+---------------
+  git clone https://github.com/Tejanarni/argo-flow.git
+  cd argo-flow
+  git checkout feature/runbooks-helm-install
+
+
+3. Install the Argo Workflows Helm chart
+----------------------------------------
+  helm repo add bitnami https://charts.bitnami.com/bitnami
+  helm repo update
+
+  helm upgrade --install argo-workflows bitnami/argo-workflows `
+    --version 13.0.6 `
+    --namespace runbooks `
+    --create-namespace `
+    -f values.yaml `
+    --wait --timeout 10m
+
+  (Git Bash: use "\" instead of "`" for line continuation.)
+  "upgrade --install" is safe to re-run; it installs the first time and upgrades after that.
+
+  Check:
+    kubectl -n runbooks get pods
+      argo-workflows-controller-...   Running
+      argo-workflows-server-...       Running
+      argo-workflows-postgresql-0     Running
+    kubectl -n runbooks logs deploy/argo-workflows-server | findstr /i "authModes SSO"
+      authModes="[sso client]"  ...  msg="SSO enabled"
+
+  If you changed only the sso block / controller config on an existing install, restart so it is re-read:
+    kubectl -n runbooks rollout restart deploy/argo-workflows-server deploy/argo-workflows-controller
+
+
+4. Install the manifests
+------------------------
+  kubectl apply -k manifests/rbac
+  kubectl apply -k manifests/demo-apps
+  kubectl apply -k manifests/runbooks
+
+  Check:
+    kubectl get workflowtemplates,cronworkflows -A
+      runbooks     : get-app-logs, get-pod-status, restart-deployment, scale-deployment
+                     cron: cron-test (every minute), check-storage-connections (hourly)
+      runbooks-l3  : cleanup-stuck-pods, cross-namespace-maintenance, provision-namespace,
+                     restart-statefulset, run-command
+    kubectl -n runbook-demo-dev get deploy,sts     # demo-app 2/2, demo-stateful 2/2
+
+  Tip: cron-test runs every minute and piles up pods. Suspend it when not demoing:
+    argo -n runbooks cron suspend cron-test
+
+
+5. Open the Argo UI and log in
+------------------------------
+  kubectl -n runbooks port-forward svc/argo-workflows-server 2746:80
+  Browser: http://localhost:2746   (use "localhost", NOT 127.0.0.1 -- must match the Entra redirect URI)
+
+  Option A - SSO: click "Login" under Single Sign-On -> sign in with your Entra account.
+             Your group decides whether you are L1 / L2 / L3.
+
+  Option B - token (no Entra needed), pick the tier to act as:
+    kubectl -n runbooks create token l1-user     --duration=8h
+    kubectl -n runbooks create token l2-approver --duration=8h
+    kubectl -n runbooks create token l3-approver --duration=8h
+  In the UI login box paste:  Bearer <token>
+  (Log out and back in with another token to switch tier.)
+
+
+6. Smoke test (RBAC)
+--------------------
+  a) L1 read-only runbook (argo CLI uses your kubeconfig = admin, bypasses Argo RBAC):
+       argo -n runbooks submit --from workflowtemplate/get-pod-status --wait
+         -> get-pod-status-xxxxx Succeeded
+
+  b) Approval gate -- do this in the UI to see RBAC in action:
+       1. Log in as l1-user -> Workflow Templates -> restart-deployment -> Submit.
+          It runs "precheck" and then pauses at "approval".
+       2. Still as l1-user click RESUME -> error "... l1-user cannot update resource workflows" (forbidden).
+       3. Log out, log in as l2-approver (token or L2 Entra user) -> RESUME -> restart + verify run.
+          The approval node shows "Resumed by: ... l2-approver".
+
+     Same test from the terminal against the Argo API (port-forward must be running):
+       T1=$(kubectl -n runbooks create token l1-user)
+       T2=$(kubectl -n runbooks create token l2-approver)
+       curl -H "Authorization: Bearer $T1" -H "Content-Type: application/json" \
+         -d '{"resourceKind":"WorkflowTemplate","resourceName":"restart-deployment"}' \
+         http://localhost:2746/api/v1/workflows/runbooks/submit          # note metadata.name
+       curl -X PUT -H "Authorization: Bearer $T1" -d '{}' \
+         http://localhost:2746/api/v1/workflows/runbooks/<name>/resume   # forbidden
+       curl -X PUT -H "Authorization: Bearer $T2" -d '{}' \
+         http://localhost:2746/api/v1/workflows/runbooks/<name>/resume   # 200, workflow continues
+
+  c) No login:
+       curl -i http://localhost:2746/api/v1/workflows/runbooks            # 401
+
+
+7. Update / re-deploy later
+---------------------------
+  git pull
+  helm upgrade --install argo-workflows bitnami/argo-workflows --version 13.0.6 -n runbooks -f values.yaml --wait
+  kubectl apply -k manifests/rbac
+  kubectl apply -k manifests/demo-apps
+  kubectl apply -k manifests/runbooks
+
+
+8. Uninstall / clean slate
+--------------------------
+  kubectl delete -k manifests/runbooks
+  kubectl delete -k manifests/demo-apps
+  kubectl delete -k manifests/rbac
+  helm uninstall argo-workflows -n runbooks
+  kubectl delete ns runbooks runbooks-l3 runbook-demo-dev
+
+
+Troubleshooting
+---------------
+  - Image pull errors: the chart uses bitnamilegacy/* images (Bitnami stopped free images Aug 2025);
+    values.yaml already sets global.security.allowInsecureImages=true for that.
+  - "no matches for kind WorkflowTemplate": the Helm chart (step 3) wasn't installed first; it ships the CRDs.
+  - Port 2746 busy: use another local port, e.g. port-forward ... 8080:80 -> http://localhost:8080
+  - SSO login loops / "redirect_uri mismatch": open http://localhost:2746 (not 127.0.0.1) and check the
+    redirect URI on the Entra app registration.
+  - SSO login works but everything is "forbidden" / empty: your Entra user isn't in any of the three
+    groups, or the group GUIDs in humans.yaml (rbac-rule) and values.yaml (filterGroupsRegex) don't match
+    the Object IDs in Entra. Fix, re-apply, restart argo-server.
+  - "invalid_client" at login: the client secret in values.yaml expired or was rotated -- update it,
+    helm upgrade, restart argo-server.
+  - To go back to no-login mode for a quick demo: in values.yaml set server.auth.mode: server,
+    server.auth.sso.enabled: false, remove server.extraArgs, then helm upgrade (step 7).
+  - After a laptop restart, the pods come back on their own once Docker Desktop is running;
+    just rerun the port-forward.

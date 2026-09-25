@@ -1,5 +1,0 @@
-helm install argo-workflows bitnami/argo-workflows \
-  --version 13.0.6 \
-  --namespace runbooks \
-  --create-namespace \
-  -f values.yaml

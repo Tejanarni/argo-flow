@@ -13,11 +13,19 @@ server:
     registry: docker.io
     repository: bitnamilegacy/argo-workflow-cli
     tag: 3.7.1-debian-12-r1
+  # SSO (Entra ID) for the UI, plus client mode so a bearer token
+  # (kubectl create token l1-user ...) can still log in for testing.
+  extraArgs:
+    - --auth-mode=client
   auth:
     enabled: true
-    mode: server
+    mode: sso
     sso:
-      enabled: false
+      enabled: true
+      # Only used by the chart's argo-server ClusterRole: a truthy value grants
+      # get/list/watch on serviceaccounts, which rbac-rule lookup needs.
+      rbac:
+        enabled: true
       config:
         issuer: https://login.microsoftonline.com/ea69751a-6de3-43d6-bb89-d5e5b8caad2d/v2.0
         clientId:
@@ -38,8 +46,15 @@ server:
         # never activates and every SSO login falls back to the argo-server's
         # own (broad) ServiceAccount. Nesting rbac here rides the same
         # passthrough so it lands in the configmap's sso.rbac.enabled field.
-        # rbac:
-        #   enabled: true
+        rbac:
+          enabled: true
+        # Trim the groups claim to the three runbook groups; must match the
+        # GUIDs in the rbac-rule annotations in manifests/rbac/humans.yaml.
+        filterGroupsRegex:
+          - "d16dd38c-b215-4e9b-9a23-40a2046d9dc8"   # L1
+          - "5ebf475a-d7ea-477a-995b-f5bb3f8ade26"   # L2
+          - "3b90db67-7706-44b8-b13b-1215790f90dd"   # L3
+        sessionExpiry: 240h
 
 executor:
   image:
